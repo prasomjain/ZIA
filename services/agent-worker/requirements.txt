@@ -1,0 +1,5 @@
+mcp==1.27.2
+httpx==0.28.1
+kafka-python==2.2.15
+clickhouse-driver==0.2.9
+neo4j==5.26.0

@@ -1,0 +1,5 @@
+pytest==8.3.4
+httpx==0.28.1
+clickhouse-driver==0.2.9
+kafka-python==2.2.15
+neo4j==5.26.0

@@ -1,0 +1,157 @@
+# Zero-Day Investigation Agent (ZIA) — Phase 1 infrastructure
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    container_name: zia-clickhouse
+    ports:
+      - "8123:8123"   # HTTP
+      - "9000:9000"   # Native
+    environment:
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: ${CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT}
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 15s
+    networks:
+      - zia-net
+
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.2.4
+    container_name: zia-redpanda
+    command:
+      - redpanda
+      - start
+      - --mode
+      - dev-container
+      - --kafka-addr
+      - internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr
+      - internal://redpanda:9092,external://localhost:19092
+      - --schema-registry-addr
+      - internal://0.0.0.0:8081,external://0.0.0.0:18081
+    ports:
+      - "19092:19092" # Kafka (host)
+      - "18081:18081" # Schema Registry
+      - "18082:18082" # Pandaproxy
+      - "9644:9644"   # Admin API
+    healthcheck:
+      test: ["CMD", "rpk", "cluster", "health"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    networks:
+      - zia-net
+
+  neo4j:
+    image: neo4j:5.26-community
+    container_name: zia-neo4j
+    ports:
+      - "7474:7474" # Browser HTTP
+      - "7687:7687" # Bolt
+    environment:
+      NEO4J_AUTH: ${NEO4J_AUTH}
+    volumes:
+      - neo4j_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:7474 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks:
+      - zia-net
+
+  backend:
+    build:
+      context: ./services/backend
+    container_name: zia-backend
+    ports:
+      - "8000:8000"
+    environment:
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET}
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: 9000
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE}
+      REDPANDA_BROKERS: redpanda:9092
+      KAFKA_TOPIC_ALERTS: ${KAFKA_TOPIC_ALERTS}
+      NEO4J_URI: bolt://neo4j:7687
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+    networks:
+      - zia-net
+
+  agent-worker:
+    build:
+      context: ./services/agent-worker
+    container_name: zia-agent-worker
+    environment:
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: 9000
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE}
+      REDPANDA_BROKERS: redpanda:9092
+      KAFKA_TOPIC_ALERTS: ${KAFKA_TOPIC_ALERTS}
+      WORKER_GROUP_ID: ${WORKER_GROUP_ID}
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: ${NEO4J_USER}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD}
+      VULN_MCP_SCRIPT: ${VULN_MCP_SCRIPT}
+      EXPLOIT_MCP_SCRIPT: ${EXPLOIT_MCP_SCRIPT}
+      ASSET_INVENTORY_PATH: ${ASSET_INVENTORY_PATH}
+      ZIA_USE_MOCK_AGENT: ${ZIA_USE_MOCK_AGENT}
+      KAFKA_TOPIC_DLQ: ${KAFKA_TOPIC_DLQ:-zeroday.alerts.dlq}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-dummy}
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-}
+      CLAUDE_MODEL: ${CLAUDE_MODEL:-claude-sonnet-4-20250514}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      VT_API_KEY: ${VT_API_KEY:-}
+      ABUSEIPDB_API_KEY: ${ABUSEIPDB_API_KEY:-}
+      SHODAN_API_KEY: ${SHODAN_API_KEY:-}
+    volumes:
+      - ./mcp-tools:/app/mcp-tools:ro
+      - ./asset_inventory.json:/app/asset_inventory.json:ro
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+    networks:
+      - zia-net
+
+  ui:
+    build:
+      context: ./services/ui
+    container_name: zia-ui
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    networks:
+      - zia-net
+
+networks:
+  zia-net:
+    driver: bridge
+
+volumes:
+  clickhouse_data:
+  neo4j_data:
