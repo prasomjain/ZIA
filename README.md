@@ -51,16 +51,7 @@ flowchart TB
 
 ## Quick start
 
-### 1. Connect to the LiteLLM proxy (company Claude deployment)
-
-Run these **on your host machine** before starting Docker Compose:
-
-```bash
-aws sso login --profile di-admin
-kubectl port-forward svc/litellm-proxy 4000:4000 -n aiapp
-```
-
-Keep the port-forward running in a terminal. Docker containers reach it at `host.docker.internal:4000` (already configured in `.env`).
+### 1. Connect to the LiteLLM proxy service for free LLM model use.
 
 ### 2. Start the full stack
 
