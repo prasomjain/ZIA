@@ -279,6 +279,10 @@ class Repo:
             except (ValueError, AttributeError):
                 investigation_run_id = None
 
+        import hashlib as _hashlib
+        _fp_material = f"{','.join(sorted(cve_ids))}|{','.join(sorted(iocs))}"
+        fingerprint = _hashlib.sha256(_fp_material.encode()).hexdigest()
+
         self.ch.execute(
             """
             INSERT INTO zero_day_alerts (
@@ -298,7 +302,7 @@ class Repo:
                     str(payload.get("recommendation", "Investigate")),
                     cve_ids,
                     iocs,
-                    str(payload.get("fingerprint", "")),
+                    fingerprint,
                     int(payload.get("affected_asset_count", 0)),
                     investigation_run_id,
                     json.dumps(payload, sort_keys=True),

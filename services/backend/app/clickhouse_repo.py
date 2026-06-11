@@ -23,7 +23,7 @@ class ClickHouseRepository:
         rows = self._client.execute(
             """
             SELECT alert_id
-            FROM zero_day_alerts
+            FROM zero_day_alerts FINAL
             WHERE fingerprint = %(fingerprint)s
               AND status != 'DUPLICATE'
             ORDER BY created_at ASC
