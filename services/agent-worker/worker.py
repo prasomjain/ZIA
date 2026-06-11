@@ -489,7 +489,7 @@ class AgentLoop:
             os.environ.setdefault("ANTHROPIC_API_URL", self.settings.anthropic_base_url)
 
         try:
-            import claude_code_sdk  # type: ignore # noqa: F401
+            import anthropic  # type: ignore # noqa: F401
             self._has_claude_sdk = True
         except Exception:  # noqa: BLE001
             self._has_claude_sdk = False
@@ -559,6 +559,63 @@ class AgentLoop:
             confidence=0.9 if result.get("ok", True) else 0.2,
         )
         return result
+
+    async def _claude_executive_summary(
+        self,
+        *,
+        cves: list[str],
+        cvss_score: float,
+        epss_probability: float,
+        kev_listed: bool,
+        exploit_count: int,
+        exposed_assets: int,
+        total_assets: int,
+        actor_entities: list[str],
+        mitre_attack_matches: list[dict[str, Any]],
+        cps: float,
+        band: str,
+        payload: dict[str, Any],
+    ) -> tuple[str, int, int]:
+        """Call Claude via LiteLLM proxy to write the executive summary.
+        Returns (summary_text, input_tokens, output_tokens).
+        Falls back to empty string on any error so caller uses the template."""
+        try:
+            import anthropic
+
+            prompt = (
+                "You are a senior SOC analyst writing an executive summary for a zero-day vulnerability investigation.\n\n"
+                "Enrichment data gathered by automated threat intelligence tools:\n"
+                f"- CVEs: {', '.join(cves) if cves else 'none'}\n"
+                f"- CVSS base score: {cvss_score:.1f}/10\n"
+                f"- EPSS 30-day exploit probability: {epss_probability:.1%}\n"
+                f"- CISA KEV (actively exploited in the wild): {'YES' if kev_listed else 'NO'}\n"
+                f"- Public PoC exploit repos on GitHub: {exploit_count}\n"
+                f"- MITRE ATT&CK techniques matched: {len(mitre_attack_matches)}\n"
+                f"- Internet-facing assets exposed: {exposed_assets} of {total_assets}\n"
+                f"- Attributed threat actors: {', '.join(actor_entities) if actor_entities else 'none identified'}\n"
+                f"- Composite Priority Score: {cps:.1f}/100 — {band}\n\n"
+                "Original alert context:\n"
+                f"{sanitize_for_llm(str(payload.get('description', '') or payload.get('raw_input', '') or payload.get('title', '')))}\n\n"
+                "Write a concise 3-4 sentence executive summary for a CISO. "
+                "Synthesize the data into a coherent risk narrative — do not list numbers mechanically. "
+                "Include: overall severity, exploitability/active-exploitation status, business impact, and the single most important immediate action. "
+                "Professional prose only, no bullet points."
+            )
+
+            client = anthropic.AsyncAnthropic(
+                api_key=self.settings.anthropic_api_key or "dummy",
+                base_url=self.settings.anthropic_base_url or None,
+            )
+            response = await client.messages.create(
+                model=self.settings.model_name,
+                max_tokens=512,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            text = response.content[0].text.strip()
+            return text, response.usage.input_tokens, response.usage.output_tokens
+        except Exception as exc:  # noqa: BLE001
+            print(f"[ZIA] Claude summary generation failed ({exc}), using template fallback")
+            return "", 0, 0
 
     async def run(
         self,
@@ -783,19 +840,18 @@ class AgentLoop:
             threat_actor_severity=threat_actor_severity,
         )
 
-        # Dedicated subagent: executive summary writer (represented as separate focused loop).
+        # Build template summary as baseline / fallback.
         cve_list = ", ".join(cves) if cves else "no CVEs extracted"
         actor_list_str = ", ".join(actor_entities) if actor_entities else "no known threat actors"
         kev_str = "IS listed in the CISA Known Exploited Vulnerabilities catalog" if kev_listed else "is NOT currently listed in CISA KEV"
+        exploit_count_val = (((findings["cves"].get(cves[0]) or {}).get("public_exploits") or {}).get("data") or {}).get("total_count", 0) if cves else 0
         exploit_str = (
-            f"Public proof-of-concept exploits were found ({(((findings['cves'].get(cves[0]) or {}).get('public_exploits') or {}).get('data') or {}).get('total_count', 0)} repositories)."
+            f"Public proof-of-concept exploits were found ({exploit_count_val} repositories)."
             if public_exploit_exists and cves else
             "No public proof-of-concept exploits were found at investigation time."
         )
         tech_count = len(mitre_attack_matches)
-        sanitized_description = sanitize_for_llm(str(payload.get("description", "") or payload.get("raw_input", "")))
-
-        executive_summary = (
+        template_summary = (
             f"SEVERITY: {band} (Composite Priority Score: {cps}/100). "
             f"This investigation covers {cve_list}. "
             f"The primary vulnerability {kev_str}. "
@@ -807,7 +863,34 @@ class AgentLoop:
             f"CVSS base score: {cvss_score:.1f}/10. "
             f"Immediate action: {'patch and isolate affected systems — active exploitation confirmed via KEV listing' if kev_listed else 'monitor closely and prioritize patching based on EPSS probability'}."
         )
-        _ = sanitized_description  # used in agent event metadata below
+
+        # Try real Claude if proxy is configured and mock mode is off.
+        input_tokens = max(200, len(json.dumps(payload)) // 4)
+        output_tokens = max(120, len(template_summary) // 2)
+        executive_summary = template_summary
+        summary_mode = "template"
+
+        if not self.settings.use_mock_agent and self.settings.anthropic_base_url and self._has_claude_sdk:
+            claude_text, real_input, real_output = await self._claude_executive_summary(
+                cves=cves,
+                cvss_score=cvss_score,
+                epss_probability=epss_probability,
+                kev_listed=kev_listed,
+                exploit_count=exploit_count_val,
+                exposed_assets=exposed_assets,
+                total_assets=total_assets,
+                actor_entities=actor_entities,
+                mitre_attack_matches=mitre_attack_matches,
+                cps=cps,
+                band=band,
+                payload=payload,
+            )
+            if claude_text:
+                executive_summary = claude_text
+                input_tokens = real_input
+                output_tokens = real_output
+                summary_mode = "claude"
+
         self.repo.log_agent_event(
             investigation_run_id=investigation_run_id,
             alert_id=alert_id,
@@ -820,14 +903,9 @@ class AgentLoop:
                 "composite_priority_score": cps,
                 "severity_band": band,
                 "mitre_attack_count": len(mitre_attack_matches),
+                "summary_mode": summary_mode,
             },
         )
-
-        # Fix #12: real cost calculation (input tokens approximated from payload size,
-        # output tokens from summary length). When the real Claude SDK is used, the
-        # SDK reports actual usage which would replace these estimates.
-        input_tokens = max(200, len(json.dumps(payload)) // 4)
-        output_tokens = max(120, len(executive_summary) // 2)
         self.repo.log_token_usage(
             investigation_run_id=investigation_run_id,
             alert_id=alert_id,
